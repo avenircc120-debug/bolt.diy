@@ -1,7 +1,8 @@
+
 import type { AppLoadContext } from '@remix-run/cloudflare';
 import { RemixServer } from '@remix-run/react';
 import { isbot } from 'isbot';
-import { renderToReadableStream } from 'react-dom/server';
+import { renderToReadableStream } from 'react-dom/server.browser';
 import { renderHeadToString } from 'remix-island';
 import { Head } from './root';
 import { themeStore } from '~/lib/stores/theme';
@@ -77,4 +78,4 @@ export default async function handleRequest(
     headers: responseHeaders,
     status: responseStatusCode,
   });
-}
+                      }
