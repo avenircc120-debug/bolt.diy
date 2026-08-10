@@ -3,19 +3,25 @@ import * as build from '../build/server/index.js';
 
 const handler = createRequestHandler(build, process.env.NODE_ENV);
 
-export default async function (req, res) {
-  // Reconstruct a Fetch API Request from the Vercel Node.js req object
-  const url = `https://${req.headers.host}${req.url}`;
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
 
-  const controller = new AbortController();
-  req.on('close', () => controller.abort());
+export default async function (req, res) {
+  const url = `https://${req.headers.host}${req.url}`;
+  const isBodyless = ['GET', 'HEAD'].includes(req.method);
+
+  const body = isBodyless ? undefined : await readRequestBody(req);
 
   const request = new Request(url, {
     method: req.method,
     headers: req.headers,
-    body: ['GET', 'HEAD'].includes(req.method) ? undefined : req,
-    signal: controller.signal,
-    duplex: 'half',
+    body,
   });
 
   // This context object mimics the shape the app expects from Cloudflare,
@@ -31,8 +37,14 @@ export default async function (req, res) {
 
   res.statusCode = response.status;
   response.headers.forEach((value, key) => {
+    // Let Vercel/Node manage these automatically
+    if (key.toLowerCase() === 'content-encoding' || key.toLowerCase() === 'content-length') {
+      return;
+    }
+
     res.setHeader(key, value);
   });
+  res.flushHeaders?.();
 
   if (response.body) {
     const reader = response.body.getReader();
@@ -50,4 +62,4 @@ export default async function (req, res) {
   }
 
   res.end();
-}
+        }
