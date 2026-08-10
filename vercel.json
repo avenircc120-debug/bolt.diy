@@ -1,0 +1,17 @@
+{
+  "buildCommand": "pnpm run build",
+  "outputDirectory": "build/client",
+  "framework": null,
+  "functions": {
+    "api/index.js": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api"
+    }
+  ]
+}
