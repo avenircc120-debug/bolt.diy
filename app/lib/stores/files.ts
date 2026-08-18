@@ -1,13 +1,8 @@
-import type { PathWatcherEvent, WebContainer } from '@webcontainer/api';
 import { getEncoding } from 'istextorbinary';
 import { map, type MapStore } from 'nanostores';
 import { Buffer } from 'node:buffer';
-import { path } from '~/utils/path';
-import { bufferWatchEvents } from '~/utils/buffer';
-import { WORK_DIR } from '~/utils/constants';
 import { computeFileModifications } from '~/utils/diff';
 import { createScopedLogger } from '~/utils/logger';
-import { unreachable } from '~/utils/unreachable';
 import {
   addLockedFile,
   removeLockedFile,
@@ -23,8 +18,6 @@ import {
 import { getCurrentChatId } from '~/utils/fileLocks';
 
 const logger = createScopedLogger('FilesStore');
-
-const utf8TextDecoder = new TextDecoder('utf8', { fatal: true });
 
 export interface File {
   type: 'file';
@@ -44,8 +37,35 @@ type Dirent = File | Folder;
 
 export type FileMap = Record<string, Dirent | undefined>;
 
+/**
+ * Reads a project file's raw content from the backend (Cloudflare Worker,
+ * which talks to GitHub). Returns null if the file doesn't exist.
+ */
+export type BackendReadFileFn = (filePath: string) => Promise<{ content: string; isBinary: boolean } | null>;
+
+/**
+ * Writes a project file's content via the backend (Cloudflare Worker,
+ * which commits to GitHub).
+ */
+export type BackendWriteFileFn = (filePath: string, content: string | Uint8Array) => Promise<void>;
+
+/**
+ * Deletes a project file or folder via the backend.
+ */
+export type BackendDeleteFn = (path: string, isFolder: boolean) => Promise<void>;
+
+/**
+ * FilesStore no longer talks to a local WebContainer filesystem. All reads,
+ * writes, and deletes go through backend functions supplied by the caller,
+ * which are expected to be backed by the Cloudflare Worker + GitHub API.
+ * There is no local file watcher: the store is only ever updated in
+ * response to an explicit edit (from the editor or from the AI), never from
+ * a background filesystem event, since there is no local filesystem.
+ */
 export class FilesStore {
-  #webcontainer: Promise<WebContainer>;
+  #backendRead: BackendReadFileFn;
+  #backendWrite: BackendWriteFileFn;
+  #backendDelete: BackendDeleteFn;
 
   /**
    * Tracks the number of files without folders.
@@ -65,7 +85,7 @@ export class FilesStore {
   #deletedPaths: Set<string> = import.meta.hot?.data.deletedPaths ?? new Set();
 
   /**
-   * Map of files that matches the state of WebContainer.
+   * Map of files loaded for the current project.
    */
   files: MapStore<FileMap> = import.meta.hot?.data.files ?? map({});
 
@@ -73,8 +93,10 @@ export class FilesStore {
     return this.#size;
   }
 
-  constructor(webcontainerPromise: Promise<WebContainer>) {
-    this.#webcontainer = webcontainerPromise;
+  constructor(backendRead: BackendReadFileFn, backendWrite: BackendWriteFileFn, backendDelete: BackendDeleteFn) {
+    this.#backendRead = backendRead;
+    this.#backendWrite = backendWrite;
+    this.#backendDelete = backendDelete;
 
     // Load deleted paths from localStorage if available
     try {
@@ -120,8 +142,6 @@ export class FilesStore {
 
       observer.observe(document, { subtree: true, childList: true });
     }
-
-    this.#init();
   }
 
   /**
@@ -131,7 +151,6 @@ export class FilesStore {
   #loadLockedFiles(chatId?: string) {
     try {
       const currentChatId = chatId || getCurrentChatId();
-      const startTime = performance.now();
 
       // Migrate any legacy locks to the current chat
       migrateLegacyLocks(currentChatId);
@@ -144,13 +163,8 @@ export class FilesStore {
       const lockedFolders = lockedItems.filter((item) => item.isFolder);
 
       if (lockedItems.length === 0) {
-        logger.info(`No locked items found for chat ID: ${currentChatId}`);
         return;
       }
-
-      logger.info(
-        `Found ${lockedFiles.length} locked files and ${lockedFolders.length} locked folders for chat ID: ${currentChatId}`,
-      );
 
       const currentFiles = this.files.get();
       const updates: FileMap = {};
@@ -185,9 +199,6 @@ export class FilesStore {
       if (Object.keys(updates).length > 0) {
         this.files.set({ ...currentFiles, ...updates });
       }
-
-      const endTime = performance.now();
-      logger.info(`Loaded locked items in ${Math.round(endTime - startTime)}ms`);
     } catch (error) {
       logger.error('Failed to load locked files from localStorage', error);
     }
@@ -195,43 +206,21 @@ export class FilesStore {
 
   /**
    * Apply a lock to all files within a folder
-   * @param currentFiles Current file map
-   * @param updates Updates to apply
-   * @param folderPath Path of the folder to lock
    */
   #applyLockToFolderContents(currentFiles: FileMap, updates: FileMap, folderPath: string) {
     const folderPrefix = folderPath.endsWith('/') ? folderPath : `${folderPath}/`;
 
-    // Find all files that are within this folder
     Object.entries(currentFiles).forEach(([path, file]) => {
       if (path.startsWith(folderPrefix) && file) {
         if (file.type === 'file') {
-          updates[path] = {
-            ...file,
-            isLocked: true,
-
-            // Add a property to indicate this is locked by a parent folder
-            lockedByFolder: folderPath,
-          };
+          updates[path] = { ...file, isLocked: true, lockedByFolder: folderPath };
         } else if (file.type === 'folder') {
-          updates[path] = {
-            ...file,
-            isLocked: true,
-
-            // Add a property to indicate this is locked by a parent folder
-            lockedByFolder: folderPath,
-          };
+          updates[path] = { ...file, isLocked: true, lockedByFolder: folderPath };
         }
       }
     });
   }
 
-  /**
-   * Lock a file
-   * @param filePath Path to the file to lock
-   * @param chatId Optional chat ID (defaults to current chat)
-   * @returns True if the file was successfully locked
-   */
   lockFile(filePath: string, chatId?: string) {
     const file = this.getFile(filePath);
     const currentChatId = chatId || getCurrentChatId();
@@ -241,26 +230,13 @@ export class FilesStore {
       return false;
     }
 
-    // Update the file in the store
-    this.files.setKey(filePath, {
-      ...file,
-      isLocked: true,
-    });
-
-    // Persist to localStorage with chat ID
+    this.files.setKey(filePath, { ...file, isLocked: true });
     addLockedFile(currentChatId, filePath);
-
     logger.info(`File locked: ${filePath} for chat: ${currentChatId}`);
 
     return true;
   }
 
-  /**
-   * Lock a folder and all its contents
-   * @param folderPath Path to the folder to lock
-   * @param chatId Optional chat ID (defaults to current chat)
-   * @returns True if the folder was successfully locked
-   */
   lockFolder(folderPath: string, chatId?: string) {
     const folder = this.getFileOrFolder(folderPath);
     const currentFiles = this.files.get();
@@ -272,33 +248,16 @@ export class FilesStore {
     }
 
     const updates: FileMap = {};
+    updates[folderPath] = { type: folder.type, isLocked: true };
 
-    // Update the folder in the store
-    updates[folderPath] = {
-      type: folder.type,
-      isLocked: true,
-    };
-
-    // Apply lock to all files within the folder
     this.#applyLockToFolderContents(currentFiles, updates, folderPath);
-
-    // Update the store with all changes
     this.files.set({ ...currentFiles, ...updates });
-
-    // Persist to localStorage with chat ID
     addLockedFolder(currentChatId, folderPath);
-
     logger.info(`Folder locked: ${folderPath} for chat: ${currentChatId}`);
 
     return true;
   }
 
-  /**
-   * Unlock a file
-   * @param filePath Path to the file to unlock
-   * @param chatId Optional chat ID (defaults to current chat)
-   * @returns True if the file was successfully unlocked
-   */
   unlockFile(filePath: string, chatId?: string) {
     const file = this.getFile(filePath);
     const currentChatId = chatId || getCurrentChatId();
@@ -308,27 +267,13 @@ export class FilesStore {
       return false;
     }
 
-    // Update the file in the store
-    this.files.setKey(filePath, {
-      ...file,
-      isLocked: false,
-      lockedByFolder: undefined, // Clear the parent folder lock reference if it exists
-    });
-
-    // Remove from localStorage with chat ID
+    this.files.setKey(filePath, { ...file, isLocked: false, lockedByFolder: undefined });
     removeLockedFile(currentChatId, filePath);
-
     logger.info(`File unlocked: ${filePath} for chat: ${currentChatId}`);
 
     return true;
   }
 
-  /**
-   * Unlock a folder and all its contents
-   * @param folderPath Path to the folder to unlock
-   * @param chatId Optional chat ID (defaults to current chat)
-   * @returns True if the folder was successfully unlocked
-   */
   unlockFolder(folderPath: string, chatId?: string) {
     const folder = this.getFileOrFolder(folderPath);
     const currentFiles = this.files.get();
@@ -340,51 +285,27 @@ export class FilesStore {
     }
 
     const updates: FileMap = {};
+    updates[folderPath] = { type: folder.type, isLocked: false };
 
-    // Update the folder in the store
-    updates[folderPath] = {
-      type: folder.type,
-      isLocked: false,
-    };
-
-    // Find all files that are within this folder and unlock them
     const folderPrefix = folderPath.endsWith('/') ? folderPath : `${folderPath}/`;
 
     Object.entries(currentFiles).forEach(([path, file]) => {
       if (path.startsWith(folderPrefix) && file) {
         if (file.type === 'file' && file.lockedByFolder === folderPath) {
-          updates[path] = {
-            ...file,
-            isLocked: false,
-            lockedByFolder: undefined,
-          };
+          updates[path] = { ...file, isLocked: false, lockedByFolder: undefined };
         } else if (file.type === 'folder' && file.lockedByFolder === folderPath) {
-          updates[path] = {
-            type: file.type,
-            isLocked: false,
-            lockedByFolder: undefined,
-          };
+          updates[path] = { type: file.type, isLocked: false, lockedByFolder: undefined };
         }
       }
     });
 
-    // Update the store with all changes
     this.files.set({ ...currentFiles, ...updates });
-
-    // Remove from localStorage with chat ID
     removeLockedFolder(currentChatId, folderPath);
-
     logger.info(`Folder unlocked: ${folderPath} for chat: ${currentChatId}`);
 
     return true;
   }
 
-  /**
-   * Check if a file is locked
-   * @param filePath Path to the file to check
-   * @param chatId Optional chat ID (defaults to current chat)
-   * @returns Object with locked status, lock mode, and what caused the lock
-   */
   isFileLocked(filePath: string, chatId?: string): { locked: boolean; lockedBy?: string } {
     const file = this.getFile(filePath);
     const currentChatId = chatId || getCurrentChatId();
@@ -393,72 +314,37 @@ export class FilesStore {
       return { locked: false };
     }
 
-    // First check the in-memory state
     if (file.isLocked) {
-      // If the file is locked by a folder, include that information
       if (file.lockedByFolder) {
-        return {
-          locked: true,
-          lockedBy: file.lockedByFolder as string,
-        };
+        return { locked: true, lockedBy: file.lockedByFolder as string };
       }
-
-      return {
-        locked: true,
-        lockedBy: filePath,
-      };
-    }
-
-    // Then check localStorage for direct file locks
-    const lockedFiles = getLockedFilesForChat(currentChatId);
-    const lockedFile = lockedFiles.find((item) => item.path === filePath);
-
-    if (lockedFile) {
-      // Update the in-memory state to match localStorage
-      this.files.setKey(filePath, {
-        ...file,
-        isLocked: true,
-      });
 
       return { locked: true, lockedBy: filePath };
     }
 
-    // Finally, check if the file is in a locked folder
+    const lockedFiles = getLockedFilesForChat(currentChatId);
+    const lockedFile = lockedFiles.find((item) => item.path === filePath);
+
+    if (lockedFile) {
+      this.files.setKey(filePath, { ...file, isLocked: true });
+      return { locked: true, lockedBy: filePath };
+    }
+
     const folderLockResult = this.isFileInLockedFolder(filePath, currentChatId);
 
     if (folderLockResult.locked) {
-      // Update the in-memory state to reflect the folder lock
-      this.files.setKey(filePath, {
-        ...file,
-        isLocked: true,
-        lockedByFolder: folderLockResult.lockedBy,
-      });
-
+      this.files.setKey(filePath, { ...file, isLocked: true, lockedByFolder: folderLockResult.lockedBy });
       return folderLockResult;
     }
 
     return { locked: false };
   }
 
-  /**
-   * Check if a file is within a locked folder
-   * @param filePath Path to the file to check
-   * @param chatId Optional chat ID (defaults to current chat)
-   * @returns Object with locked status, lock mode, and the folder that caused the lock
-   */
   isFileInLockedFolder(filePath: string, chatId?: string): { locked: boolean; lockedBy?: string } {
     const currentChatId = chatId || getCurrentChatId();
-
-    // Use the optimized function from lockedFiles.ts
     return isPathInLockedFolder(currentChatId, filePath);
   }
 
-  /**
-   * Check if a folder is locked
-   * @param folderPath Path to the folder to check
-   * @param chatId Optional chat ID (defaults to current chat)
-   * @returns Object with locked status and lock mode
-   */
   isFolderLocked(folderPath: string, chatId?: string): { isLocked: boolean; lockedBy?: string } {
     const folder = this.getFileOrFolder(folderPath);
     const currentChatId = chatId || getCurrentChatId();
@@ -467,25 +353,15 @@ export class FilesStore {
       return { isLocked: false };
     }
 
-    // First check the in-memory state
     if (folder.isLocked) {
-      return {
-        isLocked: true,
-        lockedBy: folderPath,
-      };
+      return { isLocked: true, lockedBy: folderPath };
     }
 
-    // Then check localStorage for this specific chat
     const lockedFolders = getLockedFoldersForChat(currentChatId);
     const lockedFolder = lockedFolders.find((item) => item.path === folderPath);
 
     if (lockedFolder) {
-      // Update the in-memory state to match localStorage
-      this.files.setKey(folderPath, {
-        type: folder.type,
-        isLocked: true,
-      });
-
+      this.files.setKey(folderPath, { type: folder.type, isLocked: true });
       return { isLocked: true, lockedBy: folderPath };
     }
 
@@ -499,7 +375,6 @@ export class FilesStore {
       return undefined;
     }
 
-    // For backward compatibility, only return file type dirents
     if (dirent.type !== 'file') {
       return undefined;
     }
@@ -507,11 +382,6 @@ export class FilesStore {
     return dirent;
   }
 
-  /**
-   * Get any file or folder from the file system
-   * @param path Path to the file or folder
-   * @returns The file or folder, or undefined if it doesn't exist
-   */
   getFileOrFolder(path: string) {
     return this.files.get()[path];
   }
@@ -519,6 +389,7 @@ export class FilesStore {
   getFileModifications() {
     return computeFileModifications(this.files.get(), this.#modifiedFiles);
   }
+
   getModifiedFiles() {
     let modifiedFiles: { [path: string]: File } | undefined = undefined;
 
@@ -547,33 +418,32 @@ export class FilesStore {
     this.#modifiedFiles.clear();
   }
 
+  /**
+   * Called once when a project is loaded (files fetched from the Worker/GitHub).
+   * Replaces the local WebContainer file watcher init.
+   */
+  loadProjectFiles(fileMap: FileMap) {
+    this.files.set(fileMap);
+    this.#size = Object.values(fileMap).filter((d) => d?.type === 'file').length;
+
+    const currentChatId = getCurrentChatId();
+    migrateLegacyLocks(currentChatId);
+    this.#loadLockedFiles(currentChatId);
+  }
+
   async saveFile(filePath: string, content: string) {
-    const webcontainer = await this.#webcontainer;
-
     try {
-      const relativePath = path.relative(webcontainer.workdir, filePath);
-
-      if (!relativePath) {
-        throw new Error(`EINVAL: invalid file path, write '${relativePath}'`);
-      }
-
       const oldContent = this.getFile(filePath)?.content;
 
-      if (!oldContent && oldContent !== '') {
-        unreachable('Expected content to be defined');
-      }
-
-      await webcontainer.fs.writeFile(relativePath, content);
+      await this.#backendWrite(filePath, content);
 
       if (!this.#modifiedFiles.has(filePath)) {
-        this.#modifiedFiles.set(filePath, oldContent);
+        this.#modifiedFiles.set(filePath, oldContent ?? '');
       }
 
-      // Get the current lock state before updating
       const currentFile = this.files.get()[filePath];
       const isLocked = currentFile?.type === 'file' ? currentFile.isLocked : false;
 
-      // we immediately update the file and don't rely on the `change` event coming from the watcher
       this.files.setKey(filePath, {
         type: 'file',
         content,
@@ -584,232 +454,27 @@ export class FilesStore {
       logger.info('File updated');
     } catch (error) {
       logger.error('Failed to update file content\n\n', error);
-
       throw error;
     }
   }
 
-  async #init() {
-    const webcontainer = await this.#webcontainer;
-
-    // Clean up any files that were previously deleted
-    this.#cleanupDeletedFiles();
-
-    // Set up file watcher
-    webcontainer.internal.watchPaths(
-      {
-        include: [`${WORK_DIR}/**`],
-        exclude: ['**/node_modules', '.git', '**/package-lock.json'],
-        includeContent: true,
-      },
-      bufferWatchEvents(100, this.#processEventBuffer.bind(this)),
-    );
-
-    // Get the current chat ID
-    const currentChatId = getCurrentChatId();
-
-    // Migrate any legacy locks to the current chat
-    migrateLegacyLocks(currentChatId);
-
-    // Load locked files immediately for the current chat
-    this.#loadLockedFiles(currentChatId);
-
-    /**
-     * Also set up a timer to load locked files again after a delay.
-     * This ensures that locks are applied even if files are loaded asynchronously.
-     */
-    setTimeout(() => {
-      this.#loadLockedFiles(currentChatId);
-    }, 2000);
-
-    /**
-     * Set up a less frequent periodic check to ensure locks remain applied.
-     * This is now less critical since we have the storage event listener.
-     */
-    setInterval(() => {
-      // Clear the cache to force a fresh read from localStorage
-      clearCache();
-
-      const latestChatId = getCurrentChatId();
-      this.#loadLockedFiles(latestChatId);
-    }, 30000); // Reduced from 10s to 30s
-  }
-
-  /**
-   * Removes any deleted files/folders from the store
-   */
-  #cleanupDeletedFiles() {
-    if (this.#deletedPaths.size === 0) {
-      return;
-    }
-
-    const currentFiles = this.files.get();
-    const pathsToDelete = new Set<string>();
-
-    // Precompute prefixes for efficient checking
-    const deletedPrefixes = [...this.#deletedPaths].map((p) => p + '/');
-
-    // Iterate through all current files/folders once
-    for (const [path, dirent] of Object.entries(currentFiles)) {
-      // Skip if dirent is already undefined (shouldn't happen often but good practice)
-      if (!dirent) {
-        continue;
-      }
-
-      // Check for exact match in deleted paths
-      if (this.#deletedPaths.has(path)) {
-        pathsToDelete.add(path);
-        continue; // No need to check prefixes if it's an exact match
-      }
-
-      // Check if the path starts with any of the deleted folder prefixes
-      for (const prefix of deletedPrefixes) {
-        if (path.startsWith(prefix)) {
-          pathsToDelete.add(path);
-          break; // Found a match, no need to check other prefixes for this path
-        }
-      }
-    }
-
-    // Perform the deletions and updates based on the collected paths
-    if (pathsToDelete.size > 0) {
-      const updates: FileMap = {};
-
-      for (const pathToDelete of pathsToDelete) {
-        const dirent = currentFiles[pathToDelete];
-        updates[pathToDelete] = undefined; // Mark for deletion in the map update
-
-        if (dirent?.type === 'file') {
-          this.#size--;
-
-          if (this.#modifiedFiles.has(pathToDelete)) {
-            this.#modifiedFiles.delete(pathToDelete);
-          }
-        }
-      }
-
-      // Apply all deletions to the store at once for potential efficiency
-      this.files.set({ ...currentFiles, ...updates });
-    }
-  }
-
-  #processEventBuffer(events: Array<[events: PathWatcherEvent[]]>) {
-    const watchEvents = events.flat(2);
-
-    for (const { type, path, buffer } of watchEvents) {
-      // remove any trailing slashes
-      const sanitizedPath = path.replace(/\/+$/g, '');
-
-      switch (type) {
-        case 'add_dir': {
-          // we intentionally add a trailing slash so we can distinguish files from folders in the file tree
-          this.files.setKey(sanitizedPath, { type: 'folder' });
-          break;
-        }
-        case 'remove_dir': {
-          this.files.setKey(sanitizedPath, undefined);
-
-          for (const [direntPath] of Object.entries(this.files)) {
-            if (direntPath.startsWith(sanitizedPath)) {
-              this.files.setKey(direntPath, undefined);
-            }
-          }
-
-          break;
-        }
-        case 'add_file':
-        case 'change': {
-          if (type === 'add_file') {
-            this.#size++;
-          }
-
-          let content = '';
-
-          /**
-           * @note This check is purely for the editor. The way we detect this is not
-           * bullet-proof and it's a best guess so there might be false-positives.
-           * The reason we do this is because we don't want to display binary files
-           * in the editor nor allow to edit them.
-           */
-          const isBinary = isBinaryFile(buffer);
-
-          if (!isBinary) {
-            content = this.#decodeFileContent(buffer);
-          }
-
-          this.files.setKey(sanitizedPath, { type: 'file', content, isBinary });
-
-          break;
-        }
-        case 'remove_file': {
-          this.#size--;
-          this.files.setKey(sanitizedPath, undefined);
-          break;
-        }
-        case 'update_directory': {
-          // we don't care about these events
-          break;
-        }
-      }
-    }
-  }
-
-  #decodeFileContent(buffer?: Uint8Array) {
-    if (!buffer || buffer.byteLength === 0) {
-      return '';
-    }
-
-    try {
-      return utf8TextDecoder.decode(buffer);
-    } catch (error) {
-      console.log(error);
-      return '';
-    }
-  }
-
   async createFile(filePath: string, content: string | Uint8Array = '') {
-    const webcontainer = await this.#webcontainer;
-
     try {
-      const relativePath = path.relative(webcontainer.workdir, filePath);
-
-      if (!relativePath) {
-        throw new Error(`EINVAL: invalid file path, create '${relativePath}'`);
-      }
-
-      const dirPath = path.dirname(relativePath);
-
-      if (dirPath !== '.') {
-        await webcontainer.fs.mkdir(dirPath, { recursive: true });
-      }
-
       const isBinary = content instanceof Uint8Array;
 
+      await this.#backendWrite(filePath, content);
+
       if (isBinary) {
-        await webcontainer.fs.writeFile(relativePath, Buffer.from(content));
-
         const base64Content = Buffer.from(content).toString('base64');
-        this.files.setKey(filePath, {
-          type: 'file',
-          content: base64Content,
-          isBinary: true,
-          isLocked: false,
-        });
-
+        this.files.setKey(filePath, { type: 'file', content: base64Content, isBinary: true, isLocked: false });
         this.#modifiedFiles.set(filePath, base64Content);
       } else {
-        const contentToWrite = (content as string).length === 0 ? ' ' : content;
-        await webcontainer.fs.writeFile(relativePath, contentToWrite);
-
-        this.files.setKey(filePath, {
-          type: 'file',
-          content: content as string,
-          isBinary: false,
-          isLocked: false,
-        });
-
-        this.#modifiedFiles.set(filePath, content as string);
+        const contentStr = content as string;
+        this.files.setKey(filePath, { type: 'file', content: contentStr, isBinary: false, isLocked: false });
+        this.#modifiedFiles.set(filePath, contentStr);
       }
+
+      this.#size++;
 
       logger.info(`File created: ${filePath}`);
 
@@ -821,19 +486,8 @@ export class FilesStore {
   }
 
   async createFolder(folderPath: string) {
-    const webcontainer = await this.#webcontainer;
-
     try {
-      const relativePath = path.relative(webcontainer.workdir, folderPath);
-
-      if (!relativePath) {
-        throw new Error(`EINVAL: invalid folder path, create '${relativePath}'`);
-      }
-
-      await webcontainer.fs.mkdir(relativePath, { recursive: true });
-
       this.files.setKey(folderPath, { type: 'folder' });
-
       logger.info(`Folder created: ${folderPath}`);
 
       return true;
@@ -844,19 +498,10 @@ export class FilesStore {
   }
 
   async deleteFile(filePath: string) {
-    const webcontainer = await this.#webcontainer;
-
     try {
-      const relativePath = path.relative(webcontainer.workdir, filePath);
-
-      if (!relativePath) {
-        throw new Error(`EINVAL: invalid file path, delete '${relativePath}'`);
-      }
-
-      await webcontainer.fs.rm(relativePath);
+      await this.#backendDelete(filePath, false);
 
       this.#deletedPaths.add(filePath);
-
       this.files.setKey(filePath, undefined);
       this.#size--;
 
@@ -876,19 +521,10 @@ export class FilesStore {
   }
 
   async deleteFolder(folderPath: string) {
-    const webcontainer = await this.#webcontainer;
-
     try {
-      const relativePath = path.relative(webcontainer.workdir, folderPath);
-
-      if (!relativePath) {
-        throw new Error(`EINVAL: invalid folder path, delete '${relativePath}'`);
-      }
-
-      await webcontainer.fs.rm(relativePath, { recursive: true });
+      await this.#backendDelete(folderPath, true);
 
       this.#deletedPaths.add(folderPath);
-
       this.files.setKey(folderPath, undefined);
 
       const allFiles = this.files.get();
@@ -896,7 +532,6 @@ export class FilesStore {
       for (const [path, dirent] of Object.entries(allFiles)) {
         if (path.startsWith(folderPath + '/')) {
           this.files.setKey(path, undefined);
-
           this.#deletedPaths.add(path);
 
           if (dirent?.type === 'file') {
@@ -932,7 +567,7 @@ export class FilesStore {
   }
 }
 
-function isBinaryFile(buffer: Uint8Array | undefined) {
+export function isBinaryFile(buffer: Uint8Array | undefined) {
   if (buffer === undefined) {
     return false;
   }
